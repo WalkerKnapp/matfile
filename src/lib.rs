@@ -1,3 +1,4 @@
+#![feature(extract_if)]
 #![doc(html_root_url = "https://docs.rs/matfile/0.4.1")]
 
 //! Matfile is a library for reading (and in the future writing) Matlab ".mat" files.
@@ -62,6 +63,10 @@
 #[macro_use]
 extern crate enum_primitive_derive;
 
+use std::collections::HashMap;
+use std::iter::{FromIterator, zip};
+use crate::parse::DataElement;
+
 #[cfg(feature = "ndarray")]
 pub mod ndarray;
 mod parse;
@@ -79,6 +84,7 @@ mod parse;
 #[derive(Clone, Debug)]
 pub struct MatFile {
     arrays: Vec<Array>,
+    structure_arrays: Vec<StructureArray>
 }
 
 /// A numeric array (the only type supported at the moment).
@@ -155,6 +161,12 @@ pub enum NumericData {
         real: Vec<f64>,
         imag: Option<Vec<f64>>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct StructureArray {
+    name: String,
+    fields: HashMap<String, NumericData>
 }
 
 fn try_convert_number_format(
@@ -468,6 +480,15 @@ impl Array {
     }
 }
 
+impl StructureArray {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn get_field(&self, name: &str) -> Option<&NumericData> {
+        self.fields.get(name)
+    }
+}
+
 impl MatFile {
     /// Tries to parse a byte sequence as a ".mat" file.
     pub fn parse<R: std::io::Read>(mut reader: R) -> Result<Self, Error> {
@@ -475,12 +496,13 @@ impl MatFile {
         reader
             .read_to_end(&mut buf)
             .map_err(|err| Error::IOError(err))?;
-        let (_remaining, parse_result) = parse::parse_all(&buf)
+        let (_remaining, mut parse_result) = parse::parse_all(&buf)
             .map_err(|err| Error::ParseError(parse::replace_err_slice(err, &[])))?;
-        let arrays: Result<Vec<Array>, Error> = parse_result
-            .data_elements
-            .into_iter()
-            .filter_map(|data_element| match data_element {
+
+        let arrays: Result<Vec<Array>, Error> = parse_result.data_elements
+            .extract_if(|data_element| {
+                matches!(data_element, parse::DataElement::NumericMatrix { .. })
+            }).filter_map(|data_element| match data_element {
                 parse::DataElement::NumericMatrix(flags, dims, name, real, imag) => {
                     let size = dims.into_iter().map(|d| d as usize).collect();
                     let numeric_data = match NumericData::try_from(flags.class, real, imag) {
@@ -492,12 +514,43 @@ impl MatFile {
                         name: name,
                         data: numeric_data,
                     }))
-                }
-                _ => None,
-            })
-            .collect();
+                },
+                _ => unreachable!() // Type checked above with `matches!`
+        }).collect();
+
+        let structs: Result<Vec<StructureArray>, Error> = parse_result.data_elements
+            .extract_if(|data_element| {
+                matches!(data_element, parse::DataElement::StructureMatrix { .. })
+            }).filter_map(|data_element| match data_element {
+                parse::DataElement::StructureMatrix(flags, dims, name, field_names, fields) => {
+                    let fields: Result<Vec<(String, NumericData)>, Error> = zip(field_names, fields.into_iter())
+                        .filter_map(|(field_name, field)| { // TODO: This only supports numeric matrices as children
+                            match field {
+                                parse::DataElement::NumericMatrix(flags, dims, name, real, imag) => {
+                                    let numeric_data = match NumericData::try_from(flags.class, real, imag) {
+                                        Ok(numeric_data) => numeric_data,
+                                        Err(err) => return Some(Err(err)),
+                                    };
+                                    Some(Ok((field_name, numeric_data)))
+                                },
+                                _ => None
+                            }
+                        })
+                        .collect();
+
+                    Some(fields.map(|fields| {
+                        StructureArray {
+                            name,
+                            fields: HashMap::from_iter(fields.into_iter())
+                        }
+                    }))
+                },
+                _ => unreachable!() // Type checked above with `matches!`
+        }).collect();
+
         let arrays = arrays?;
-        Ok(MatFile { arrays: arrays })
+        let structs = structs?;
+        Ok(MatFile { arrays: arrays, structure_arrays: structs })
     }
 
     /// List of all arrays in this .mat file.
@@ -516,6 +569,15 @@ impl MatFile {
     /// returned by this function.
     pub fn find_by_name<'me>(&'me self, name: &'_ str) -> Option<&'me Array> {
         for array in &self.arrays {
+            if array.name == name {
+                return Some(array);
+            }
+        }
+        None
+    }
+
+    pub fn find_struct_by_name<'me>(&'me self, name: &'_ str) -> Option<&'me StructureArray> {
+        for array in &self.structure_arrays {
             if array.name == name {
                 return Some(array);
             }

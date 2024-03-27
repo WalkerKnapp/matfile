@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use libflate::zlib::Decoder;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
@@ -19,6 +20,7 @@ use nom::sequence::pair;
 use nom::{error_position, IResult};
 use num_traits::FromPrimitive;
 use std::io::Read;
+use std::iter::{FromIterator, zip};
 
 // https://www.mathworks.com/help/pdf_doc/matlab/matfile_format.pdf
 // https://www.mathworks.com/help/matlab/import_export/mat-file-versions.html
@@ -95,7 +97,13 @@ pub enum DataElement {
     ),
     // CharacterMatrix,
     // Cell Matrix,
-    // Structure Matrix,
+    StructureMatrix(
+        ArrayFlags,
+        Dimensions,
+        String,
+        Vec<String>,
+        Vec<DataElement>
+    ),
     // Object Matrix,
     Unsupported,
 }
@@ -333,7 +341,7 @@ fn parse_array_name_subelement(
 ) -> impl Fn(&[u8]) -> IResult<&[u8], String> {
     move |i: &[u8]| {
         let (i, data_element_tag) = parse_data_element_tag(endianness)(i)?;
-        if !(data_element_tag.data_type == DataType::Int8 && data_element_tag.data_byte_size > 0) {
+        if !(data_element_tag.data_type == DataType::Int8) {
             return Err(nom::Err::Failure(error_position!(
                 i,
                 // TODO
@@ -416,9 +424,10 @@ fn parse_matrix_data_element(
     move |i: &[u8]| {
         let (i, flags) = parse_array_flags_subelement(endianness)(i)?;
         match flags.class {
-            ArrayType::Cell | ArrayType::Struct | ArrayType::Object | ArrayType::Char => {
+            ArrayType::Cell | ArrayType::Object | ArrayType::Char => {
                 parse_unsupported_data_element(endianness)(i)
             }
+            ArrayType::Struct => parse_struct_matrix_subelements(endianness, flags)(i),
             ArrayType::Sparse => parse_sparse_matrix_subelements(endianness, flags)(i),
             _ => parse_numeric_matrix_subelements(endianness, flags)(i),
         }
@@ -746,6 +755,83 @@ pub fn replace_err_slice<'old, 'new>(
             input: new_slice,
         }),
         nom::Err::Incomplete(needed) => nom::Err::Incomplete(needed),
+    }
+}
+
+fn parse_struct_matrix_subelements(
+    endianness: nom::number::Endianness,
+    flags: ArrayFlags,
+) -> impl Fn(&[u8]) -> IResult<&[u8], DataElement> {
+    move |i: &[u8]| {
+        let (i, dimensions) = parse_dimensions_array_subelement(endianness)(i)?;
+        let (i, name) = parse_array_name_subelement(endianness)(i)?;
+        let (i, field_name_length) = parse_field_name_length_subelement(endianness)(i)?;
+        let (i, field_names) = parse_field_names_subelement(endianness, field_name_length)(i)?;
+
+        let (i, fields) = parse_fields_subelement(endianness, &field_names)(i)?;
+
+        Ok((i, DataElement::StructureMatrix(
+            flags,
+            dimensions,
+            name,
+            field_names.clone(),
+            fields
+        )))
+    }
+}
+
+fn parse_field_name_length_subelement(
+    endianness: nom::number::Endianness
+) -> impl Fn(&[u8]) -> IResult<&[u8], i32> {
+    move |i: &[u8]| {
+        let (i, data_element_tag) = parse_data_element_tag(endianness)(i)?;
+        if !(data_element_tag.data_type == DataType::Int32 && data_element_tag.data_byte_size == 4) {
+            return Err(nom::Err::Failure(error_position!(
+                i,
+                // TODO
+                nom::error::ErrorKind::Tag
+            )));
+        }
+        let (i, field_name_length) = i32(endianness)(i)?;
+        let (i, _) = take(data_element_tag.padding_byte_size)(i)?;
+        Ok((i, field_name_length))
+    }
+}
+
+fn parse_field_names_subelement(
+    endianness: nom::number::Endianness,
+    field_name_length: i32
+) -> impl Fn(&[u8]) -> IResult<&[u8], Vec<String>> {
+    move |i: &[u8]| {
+        let (i, data_element_tag) = parse_data_element_tag(endianness)(i)?;
+        if !(data_element_tag.data_type == DataType::Int8 && data_element_tag.data_byte_size > 0) {
+            return Err(nom::Err::Failure(error_position!(
+                i,
+                // TODO
+                nom::error::ErrorKind::Tag
+            )));
+        }
+        let (i, names) = count(map_res(take(field_name_length as usize), |b| {
+            std::str::from_utf8(b)
+                .map(|s| s.trim_end_matches('\0'))
+                .map(|s| s.to_owned())
+                .map_err(|_err| {
+                    nom::Err::Failure((i, nom::error::ErrorKind::Tag)) // TODO
+                })
+        }), (data_element_tag.data_byte_size as usize) / (field_name_length as usize))(i)?;
+        let (i, _) = take(data_element_tag.padding_byte_size)(i)?;
+        Ok((i, names))
+    }
+}
+
+fn parse_fields_subelement(
+    endianness: nom::number::Endianness,
+    field_names: &Vec<String>
+) -> impl Fn(&[u8]) -> IResult<&[u8], Vec<DataElement>> + '_ {
+    move |i: &[u8]| {
+        let (i, fields) = count(parse_next_data_element(endianness), field_names.len())(i)?;
+
+        Ok((i, fields))
     }
 }
 
